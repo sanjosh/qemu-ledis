@@ -20,6 +20,7 @@ block-obj-y += coroutine-$(CONFIG_COROUTINE_BACKEND).o
 
 block-obj-m = block/
 
+block-obj-y += hiredis/
 
 ######################################################################
 # smartcard

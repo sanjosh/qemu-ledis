@@ -1,0 +1,2 @@
+block-obj-y = async.o hiredis.o net.o sds.o  
+
