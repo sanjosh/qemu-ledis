@@ -57,9 +57,103 @@ typedef struct LDBState {
     int64_t zeroReads;
 } LDBState;
 
+
+/*
+static int ldb_parse_uri(const char *filename, QDict *options)
+{
+    URI *uri;
+    QueryParams *qp = NULL;
+    int ret = 0;
+
+    uri = uri_parse(filename);
+    if (!uri) {
+        return -EINVAL;
+    }
+
+    // transport 
+    if (!strcmp(uri->scheme, "ldb")) {
+        ret = -EINVAL;
+        goto out;
+    }
+
+    qp = query_params_parse(uri->query);
+    if (qp->n > 1) {
+        ret = -EINVAL;
+        goto out;
+    }
+
+    {
+        QString *host;
+        // nbd://host[:port]/export 
+        if (!uri->server) {
+            ret = -EINVAL;
+            goto out;
+        }
+
+        host = qstring_from_str(uri->server);
+
+        qdict_put(options, "host", host);
+
+        if (uri->port) {
+            char* port_str = g_strdup_printf("%d", uri->port);
+            qdict_put(options, "port", qstring_from_str(port_str));
+            g_free(port_str);
+        }
+    }
+
+out:
+    if (qp) {
+        query_params_free(qp);
+    }
+    uri_free(uri);
+    return ret;
+}
+*/
+
 static void ldb_parse_filename(const char *filename, QDict *options,
                                Error **errp)
 {
+/*
+    char *file;
+    const char *host_spec;
+
+    if (strstr(filename, "://")) {
+        int ret = ldb_parse_uri(filename, options);
+        if (ret < 0) {
+            error_setg(errp, "No valid URL specified");
+        }
+        return;
+    }
+
+    file = g_strdup(filename);
+
+    // extract the host_spec - fail if it's not ldb:... 
+    if (!strstart(file, "ldb:", &host_spec)) {
+        error_setg(errp, "File name string for LDB must start with 'ldb:'");
+        goto out;
+    }
+
+    if (!*host_spec) {
+        goto out;
+    }
+
+    // are we a UNIX or TCP socket? 
+    {
+        InetSocketAddress *addr = NULL;
+
+        addr = inet_parse(host_spec, errp);
+        if (!addr) {
+            goto out;
+        }
+
+        qdict_put(options, "host", qstring_from_str(addr->host));
+        qdict_put(options, "port", qstring_from_str(addr->port));
+        qapi_free_InetSocketAddress(addr);
+    }
+
+out:
+    g_free(file);
+*/
 }
 
 static int ldb_establish_connection(BlockDriverState *bs, Error **errp)
@@ -108,19 +202,20 @@ static int ldb_open(BlockDriverState *bs, QDict *options, int flags,
     /* establish TCP connection, return error if it fails
      * TODO: Configurable retry-until-timeout behaviour.
      */
-    int sock = ldb_establish_connection(bs, errp);
+    int ret = ldb_establish_connection(bs, errp);
 
     /* LDB handshake */
     //result = ldb_client_session_init(&s->client, bs, sock, export);
     //g_free(export);
-    return sock;
+    LOG("opened connection with ret=%d\n", ret);
+    return ret;
 }
 
-//#define BLKSIZE (4096)
-//#define NUMSECTORS (BLKSIZE/512)
+//#define LDB_BLKSIZE (4096)
+//#define NUMSECTORS (LDB_BLKSIZE/512)
 
-#define BLKSIZE (512)
-#define NUMSECTORS (BLKSIZE/512)
+#define LDB_BLKSIZE (512)
+#define NUMSECTORS (LDB_BLKSIZE/512)
 
 static int ldb_read(BlockDriverState *bs, int64_t sector_num,
     uint8_t *buf, int nb_sectors)
@@ -150,6 +245,7 @@ static int ldb_read(BlockDriverState *bs, int64_t sector_num,
             if (reply->len == 0)
             {
                 s->zeroReads ++;
+                bzero(curBuf, LDB_BLKSIZE);
                 if (s->zeroReads && (s->zeroReads % 100 == 0))
                 {
                     LOG("num zero reads=%lu\n", s->zeroReads);
@@ -163,7 +259,7 @@ static int ldb_read(BlockDriverState *bs, int64_t sector_num,
 
         freeReplyObject(reply);
 
-        curBuf += BLKSIZE;
+        curBuf += LDB_BLKSIZE;
         curSector += NUMSECTORS;
     }
 
@@ -185,10 +281,10 @@ static int ldb_write(BlockDriverState *bs, int64_t sector_num,
     {
         sprintf(query, "%lu", curSector);
 
-        redisReply* reply = redisCommand(s->dataContext, "SET %b %b", query, strlen(query), curBuf, BLKSIZE);
+        redisReply* reply = redisCommand(s->dataContext, "SET %b %b", query, strlen(query), curBuf, LDB_BLKSIZE);
         freeReplyObject(reply);
 
-        curBuf += BLKSIZE;
+        curBuf += LDB_BLKSIZE;
         curSector += NUMSECTORS;
     }
     return 0;
@@ -250,6 +346,7 @@ static void ldb_close(BlockDriverState *bs)
 {
     LDBState *s = bs->opaque;
 
+    LOG("closed connection \n");
     redisFree(s->dataContext);
     //redisFree(s->metaContext);
 }
