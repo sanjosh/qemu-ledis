@@ -224,15 +224,33 @@ static int ldb_read(BlockDriverState *bs, int64_t sector_num,
     int result = 0;
 
     char query[100];
-    uint8_t* curBuf = buf;
     int64_t curSector = sector_num;
     int i = 0;
+    int lastIndex = -1;
 
     for (i = 0; i < nb_sectors/NUMSECTORS; i++)
     {
         sprintf(query, "GET %lu", curSector);
 
-        redisReply* reply = redisCommand(s->dataContext, query);
+        int localResult  = redisAppendCommand(s->dataContext, query);
+
+        lastIndex = i;
+
+        if (localResult != REDIS_OK)
+        {
+            break;
+        }
+
+        curSector += NUMSECTORS;
+    }
+
+    uint8_t* curBuf = buf;
+
+    for (i = 0; i <= lastIndex ; i++)
+    {
+        redisReply* reply = NULL;
+
+        redisGetReply(s->dataContext, (void**)&reply);
 
         if (reply->type == REDIS_REPLY_ERROR)
         {
@@ -246,10 +264,6 @@ static int ldb_read(BlockDriverState *bs, int64_t sector_num,
             {
                 s->zeroReads ++;
                 bzero(curBuf, LDB_BLKSIZE);
-                if (s->zeroReads && (s->zeroReads % 100 == 0))
-                {
-                    LOG("num zero reads=%lu\n", s->zeroReads);
-                }
             }
             else
             {
@@ -260,34 +274,53 @@ static int ldb_read(BlockDriverState *bs, int64_t sector_num,
         freeReplyObject(reply);
 
         curBuf += LDB_BLKSIZE;
-        curSector += NUMSECTORS;
     }
 
-    return result;
+    return (lastIndex == -1) ? -EIO : result;
 }
 
 static int ldb_write(BlockDriverState *bs, int64_t sector_num,
     const uint8_t *buf, int nb_sectors)
 {
     LDBState *s = bs->opaque;
+    int result = 0;
 
     char query[100];
 
     const uint8_t* curBuf = buf;
     int64_t curSector = sector_num;
     int i = 0;
+    int lastIndex = -1;
 
     for (i = 0; i < nb_sectors/NUMSECTORS; i++)
     {
         sprintf(query, "%lu", curSector);
 
-        redisReply* reply = redisCommand(s->dataContext, "SET %b %b", query, strlen(query), curBuf, LDB_BLKSIZE);
-        freeReplyObject(reply);
+        //redisReply* reply = redisCommand(s->dataContext, "SET %b %b", query, strlen(query), curBuf, LDB_BLKSIZE);
+        //freeReplyObject(reply);
+        int localResult = redisAppendCommand(s->dataContext, "SET %b %b", query, strlen(query), curBuf, LDB_BLKSIZE);
+
+        lastIndex = i;
+
+        if (localResult != REDIS_OK)
+        {
+            break;
+        }
 
         curBuf += LDB_BLKSIZE;
         curSector += NUMSECTORS;
     }
-    return 0;
+
+    for (i = 0; i <= lastIndex ; i++)
+    {
+        redisReply* reply = NULL;
+
+        redisGetReply(s->dataContext, (void**)&reply);
+
+        freeReplyObject(reply);
+    }
+
+    return (lastIndex == -1) ? -EIO : result;
 }
 
 /*
