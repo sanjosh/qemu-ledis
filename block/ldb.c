@@ -32,6 +32,8 @@
 #include "qapi/qmp/qint.h"
 #include "qapi/qmp/qstring.h"
 #include "hiredis/hiredis.h"
+#include "NonAlignedCopy.h"
+#include "qemu/crc32c.h"
 
 #include <sys/types.h>
 #include <unistd.h>
@@ -214,8 +216,9 @@ static int ldb_open(BlockDriverState *bs, QDict *options, int flags,
 //#define LDB_BLKSIZE (4096)
 //#define NUMSECTORS (LDB_BLKSIZE/512)
 
-#define LDB_BLKSIZE (512)
-#define NUMSECTORS (LDB_BLKSIZE/512)
+#define SECTOR_SIZE (512)
+#define LDB_BLKSIZE (4096)
+#define BLOCK_NUMBER(off) (off/4096)
 
 static int ldb_read(BlockDriverState *bs, int64_t sector_num,
     uint8_t *buf, int nb_sectors)
@@ -223,60 +226,80 @@ static int ldb_read(BlockDriverState *bs, int64_t sector_num,
     LDBState *s = bs->opaque;
     int result = 0;
 
-    char query[100];
-    int64_t curSector = sector_num;
-    int i = 0;
-    int lastIndex = -1;
+    NonAlignedCopy a;
+    NonAlignedCopyInit(&a, sector_num * SECTOR_SIZE, nb_sectors * SECTOR_SIZE, LDB_BLKSIZE);
 
-    for (i = 0; i < nb_sectors/NUMSECTORS; i++)
+    while (NonAlignedCopyIsValid(&a))
     {
-        sprintf(query, "GET %lu", curSector);
+        ssize_t retOff = 0;
+        ssize_t retSz = 0;
+        NonAlignedCopyNext(&a, &retOff, &retSz);
+
+        if (retSz != LDB_BLKSIZE)
+        {
+            LOG("less than 4k read at sector=%lu %d retoff=%lu siz=%lu\n", sector_num, nb_sectors, retOff, retSz);
+        }
+
+        char query[100];
+        sprintf(query, "GET %lu", BLOCK_NUMBER(retOff));
 
         int localResult  = redisAppendCommand(s->dataContext, query);
 
-        lastIndex = i;
-
         if (localResult != REDIS_OK)
         {
+            error_report("Read command issue error: %d\n", localResult);
+            result = -EIO;
             break;
         }
-
-        curSector += NUMSECTORS;
+    }
+    
+    if (result != 0)
+    {
+        return result;
     }
 
-    uint8_t* curBuf = buf;
+    NonAlignedCopyInit(&a, sector_num * SECTOR_SIZE, nb_sectors * SECTOR_SIZE, LDB_BLKSIZE);
 
-    for (i = 0; i <= lastIndex ; i++)
+    while (NonAlignedCopyIsValid(&a))
     {
-        redisReply* reply = NULL;
+        ssize_t retOff = 0;
+        ssize_t retSz = 0;
+        NonAlignedCopyNext(&a, &retOff, &retSz);
 
+        redisReply* reply = NULL;
         redisGetReply(s->dataContext, (void**)&reply);
 
         if (reply->type == REDIS_REPLY_ERROR)
         {
-            error_report("Read error: %s %d %s", reply->str, s->dataContext->err, s->dataContext->errstr);
+            error_report("Read error: %s %d %s\n", reply->str, s->dataContext->err, s->dataContext->errstr);
+            //freeReplyObject(reply);
             result = -EIO;
             break;
         }
         else
         {
+            ssize_t relativeOff = retOff - (sector_num * SECTOR_SIZE);
+            assert(relativeOff < nb_sectors * SECTOR_SIZE);
+            uint8_t* curBuf = buf + relativeOff;
+
             if (reply->len == 0)
             {
                 s->zeroReads ++;
-                bzero(curBuf, LDB_BLKSIZE);
+                bzero(curBuf, retSz);
             }
             else
             {
-                memcpy(curBuf, reply->str, reply->len);
+                ssize_t minSz = (retSz > reply->len) ? reply->len : retSz;
+                memcpy(curBuf, reply->str + (retOff % LDB_BLKSIZE), minSz);
+                //uint32_t crc = crc32c(0xffffffff, (uint8_t*)reply->str, reply->len);
+                //LOG("read at off=%lu reqsiz=%ld actual=%d checksum=%u\n", retOff, retSz, reply->len, crc);
             }
         }
 
-        freeReplyObject(reply);
-
-        curBuf += LDB_BLKSIZE;
+        //freeReplyObject(reply);
     }
 
-    return (lastIndex == -1) ? -EIO : result;
+    return 0;
 }
 
 static int ldb_write(BlockDriverState *bs, int64_t sector_num,
@@ -285,42 +308,69 @@ static int ldb_write(BlockDriverState *bs, int64_t sector_num,
     LDBState *s = bs->opaque;
     int result = 0;
 
-    char query[100];
+    NonAlignedCopy a;
+    NonAlignedCopyInit(&a, sector_num * SECTOR_SIZE, nb_sectors * SECTOR_SIZE, LDB_BLKSIZE);
 
-    const uint8_t* curBuf = buf;
-    int64_t curSector = sector_num;
-    int i = 0;
-    int lastIndex = -1;
-
-    for (i = 0; i < nb_sectors/NUMSECTORS; i++)
+    while (NonAlignedCopyIsValid(&a))
     {
-        sprintf(query, "%lu", curSector);
+        ssize_t retOff = 0;
+        ssize_t retSz = 0;
+        NonAlignedCopyNext(&a, &retOff, &retSz);
 
-        //redisReply* reply = redisCommand(s->dataContext, "SET %b %b", query, strlen(query), curBuf, LDB_BLKSIZE);
-        //freeReplyObject(reply);
-        int localResult = redisAppendCommand(s->dataContext, "SET %b %b", query, strlen(query), curBuf, LDB_BLKSIZE);
+        if (retSz != LDB_BLKSIZE)
+        {
+            LOG("less than 4k write at sector=%lu %d retoff=%lu siz=%lu\n", sector_num, nb_sectors, retOff, retSz);
+        }
 
-        lastIndex = i;
+        char query[100];
+        sprintf(query, "%lu", BLOCK_NUMBER(retOff));
+
+        ssize_t relativeOff = retOff - (sector_num * SECTOR_SIZE);
+        assert(relativeOff < nb_sectors * SECTOR_SIZE);
+        const uint8_t* curBuf = buf + relativeOff;
+
+        int localResult = redisAppendCommand(s->dataContext, "SET %b %b", query, strlen(query), curBuf, retSz);
 
         if (localResult != REDIS_OK)
         {
+            error_report("Write command issue error: %d\n", localResult);
+            result = -EIO;
             break;
         }
-
-        curBuf += LDB_BLKSIZE;
-        curSector += NUMSECTORS;
+        else
+        {
+            //uint32_t crc = crc32c(0xffffffff, curBuf, retSz);
+            //LOG("write at off=%lu siz=%lu checksum=%u\n", retOff, retSz, crc);
+        }
+    }
+    
+    if (result != 0)
+    {
+        return result;
     }
 
-    for (i = 0; i <= lastIndex ; i++)
+    NonAlignedCopyInit(&a, sector_num * SECTOR_SIZE, nb_sectors * SECTOR_SIZE, LDB_BLKSIZE);
+
+    while (NonAlignedCopyIsValid(&a))
     {
+        ssize_t retOff;
+        ssize_t retSz;
+        NonAlignedCopyNext(&a, &retOff, &retSz);
+
         redisReply* reply = NULL;
 
         redisGetReply(s->dataContext, (void**)&reply);
-
-        freeReplyObject(reply);
+        if (reply->type == REDIS_REPLY_ERROR)
+        {
+            error_report("Write error: %s %d %s\n", reply->str, s->dataContext->err, s->dataContext->errstr);
+            //freeReplyObject(reply);
+            result = -EIO;
+            break;
+        }
+        //freeReplyObject(reply);
     }
 
-    return (lastIndex == -1) ? -EIO : result;
+    return result;
 }
 
 /*
