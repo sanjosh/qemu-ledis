@@ -53,15 +53,20 @@
     __FILE__, __FUNCTION__, __LINE__, ## __VA_ARGS__); \
     } while (0)
 
+typedef struct Connection
+{
+    redisContext* context;
+    int service;
+    int port;
+} Connection;
+
 typedef struct LDBState {
-    redisContext* metaContext;
-    redisContext* dataContext; 
+    Connection data; 
+    Connection meta; 
     int64_t zeroReads;
 } LDBState;
 
-
-/*
-static int ldb_parse_uri(const char *filename, QDict *options)
+static int ldb_parse_uri(const char *filename, QDict *dict)
 {
     URI *uri;
     QueryParams *qp = NULL;
@@ -73,7 +78,7 @@ static int ldb_parse_uri(const char *filename, QDict *options)
     }
 
     // transport 
-    if (!strcmp(uri->scheme, "ldb")) {
+    if (strcmp(uri->scheme, "ldb") != 0) {
         ret = -EINVAL;
         goto out;
     }
@@ -85,22 +90,17 @@ static int ldb_parse_uri(const char *filename, QDict *options)
     }
 
     {
-        QString *host;
-        // nbd://host[:port]/export 
-        if (!uri->server) {
+        if ((!uri->server) || (!uri->port)) {
             ret = -EINVAL;
             goto out;
         }
+        
+        QString* host = qstring_from_str(uri->server);
+        qdict_put(dict, "host", host);
 
-        host = qstring_from_str(uri->server);
-
-        qdict_put(options, "host", host);
-
-        if (uri->port) {
-            char* port_str = g_strdup_printf("%d", uri->port);
-            qdict_put(options, "port", qstring_from_str(port_str));
-            g_free(port_str);
-        }
+        char* port_str = g_strdup_printf("%d", uri->port);
+        qdict_put(dict, "port", qstring_from_str(port_str));
+        g_free(port_str);
     }
 
 out:
@@ -110,17 +110,15 @@ out:
     uri_free(uri);
     return ret;
 }
-*/
 
-static void ldb_parse_filename(const char *filename, QDict *options,
+static void ldb_parse_filename(const char *filename, QDict *dict,
                                Error **errp)
 {
-/*
     char *file;
     const char *host_spec;
 
     if (strstr(filename, "://")) {
-        int ret = ldb_parse_uri(filename, options);
+        int ret = ldb_parse_uri(filename, dict);
         if (ret < 0) {
             error_setg(errp, "No valid URL specified");
         }
@@ -139,44 +137,36 @@ static void ldb_parse_filename(const char *filename, QDict *options,
         goto out;
     }
 
-    // are we a UNIX or TCP socket? 
     {
-        InetSocketAddress *addr = NULL;
+        InetSocketAddress* addr = inet_parse(host_spec, errp);
 
-        addr = inet_parse(host_spec, errp);
         if (!addr) {
             goto out;
         }
 
-        qdict_put(options, "host", qstring_from_str(addr->host));
-        qdict_put(options, "port", qstring_from_str(addr->port));
+        qdict_put(dict, "host", qstring_from_str(addr->host));
+        qdict_put(dict, "port", qstring_from_str(addr->port));
         qapi_free_InetSocketAddress(addr);
     }
 
 out:
     g_free(file);
-*/
 }
 
-static int ldb_establish_connection(BlockDriverState *bs, Error **errp)
+static int ldb_establish_connection(BlockDriverState *bs, Error** errp)
 {
     LDBState *s = bs->opaque;
 
-    s->zeroReads = 0;
-
-    int dataService = DATASERVICE;
-    int dataPort = DATAPORT;
-
     struct timeval timeout = { 1, 500000 }; // 1.5 seconds
 
-    s->dataContext = redisConnectTIPCWithTimeout(dataService, dataPort, timeout);
+    s->data.context = redisConnectTIPCWithTimeout(s->data.service, s->data.port, timeout);
 
-    if (s->dataContext == NULL || s->dataContext->err) 
+    if (s->data.context == NULL || s->data.context->err) 
     {
-        if (s->dataContext) 
+        if (s->data.context) 
         {
-            error_setg_errno(errp, -ENOTCONN, "Connection error: %s", s->dataContext->errstr);
-            redisFree(s->dataContext);
+            error_setg_errno(errp, -ENOTCONN, "Connection error to data server: %s", s->data.context->errstr);
+            redisFree(s->data.context);
         } 
         else 
         {
@@ -185,30 +175,85 @@ static int ldb_establish_connection(BlockDriverState *bs, Error **errp)
         return -ENOTCONN;
     }
 
+    s->meta.context = redisConnectTIPCWithTimeout(s->meta.service, s->meta.port, timeout);
+
+    if (s->meta.context == NULL || s->meta.context->err) 
+    {
+        if (s->meta.context) 
+        {
+            error_setg_errno(errp, -ENOTCONN, "Connection error to meta server: %s", s->meta.context->errstr);
+            redisFree(s->meta.context);
+        } 
+        else 
+        {
+            error_setg_errno(errp, -ENOTCONN, "Connection error: can't allocate redis context\n");
+        }
+
+        redisFree(s->data.context);
+        return -ENOTCONN;
+    }
+
     return 0;
 }
 
-static int ldb_open(BlockDriverState *bs, QDict *options, int flags,
+static QemuOptsList runtime_opts = {
+    .name = "ldb",  
+    .head = QTAILQ_HEAD_INITIALIZER(runtime_opts.head),
+    .desc = {
+        {
+            .name = "filename",
+            .type = QEMU_OPT_STRING,
+            .help = "LDB image name", 
+        },
+        { /* end of list */ }
+    },
+};
+
+static void ldb_config(LDBState* s, QDict* dict, Error** errp)
+{
+    Error* local_err = NULL;
+
+    QemuOpts* opts = qemu_opts_create(&runtime_opts, NULL, 0, &error_abort);
+
+    qemu_opts_absorb_qdict(opts, dict, &local_err);
+
+    const char* hostname = qemu_opt_get(opts, "host");
+    if (hostname) {
+        s->data.service = atoi(hostname);
+    } else {
+        s->data.service = DATASERVICE;
+    }
+
+    const char* portname = qemu_opt_get(opts, "port");
+    if (portname) {
+        s->data.port = atoi(portname);
+    } else {
+        s->data.port = DATAPORT;
+    }
+    
+    s->meta.service = METASERVICE;
+    s->meta.port = METAPORT;
+
+    qemu_opts_del(opts);
+    qdict_del(dict, "host");
+    qdict_del(dict, "port");
+}
+
+static int ldb_open(BlockDriverState *bs, QDict *dict, int flags,
                     Error **errp)
 {
     LDBState *s = bs->opaque;
-    (void) s;
 
-    /* Pop the config into our state object. Exit if invalid. */
-    //ldb_config(s, options, &export, &local_err);
-    //if (local_err) {
-        //error_propagate(errp, local_err);
-        //return -EINVAL;
-    //}
+    s->zeroReads = 0;
 
-    /* establish TCP connection, return error if it fails
-     * TODO: Configurable retry-until-timeout behaviour.
-     */
+    ldb_config(s, dict, errp);
+
     int ret = ldb_establish_connection(bs, errp);
 
     /* LDB handshake */
     //result = ldb_client_session_init(&s->client, bs, sock, export);
     //g_free(export);
+
     LOG("opened connection with ret=%d\n", ret);
     return ret;
 }
@@ -243,7 +288,7 @@ static int ldb_read(BlockDriverState *bs, int64_t sector_num,
         char query[100];
         sprintf(query, "GET %lu", BLOCK_NUMBER(retOff));
 
-        int localResult  = redisAppendCommand(s->dataContext, query);
+        int localResult  = redisAppendCommand(s->data.context, query);
 
         if (localResult != REDIS_OK)
         {
@@ -267,11 +312,11 @@ static int ldb_read(BlockDriverState *bs, int64_t sector_num,
         NonAlignedCopyNext(&a, &retOff, &retSz);
 
         redisReply* reply = NULL;
-        redisGetReply(s->dataContext, (void**)&reply);
+        redisGetReply(s->data.context, (void**)&reply);
 
         if (reply->type == REDIS_REPLY_ERROR)
         {
-            error_report("Read error: %s %d %s\n", reply->str, s->dataContext->err, s->dataContext->errstr);
+            error_report("Read error: %s %d %s\n", reply->str, s->data.context->err, s->data.context->errstr);
             //freeReplyObject(reply);
             result = -EIO;
             break;
@@ -302,12 +347,81 @@ static int ldb_read(BlockDriverState *bs, int64_t sector_num,
     return 0;
 }
 
+/*
+    struct dictType md5DictType
+    {
+        callbackHash
+        NULL
+        callbackValDup
+        callbackKeyCmp
+        callbackKeyDtor
+        callbackValDtor
+    };
+
+    md6dict.hashFunction = dictGenHashFunc()
+    md5dict = dictCreate(&md5DictType, NULL)
+    dictAdd(&md5Dict, key, val)
+    dictDelete(&md5Dict, key)
+    dictRelease(&md5Dict)
+    dictFind(&md5Dict, key)
+
+    for each 4k block
+        Get md5 page from meta server
+    
+    for each 4k block   
+        compute new md5
+        write page to data server
+    
+    for each new md5 generated
+        write page to meta server
+
+    NonAlignedCopy a;
+    NonAlignedCopyInit(&a, sector_num * SECTOR_SIZE, nb_sectors * SECTOR_SIZE, LDB_BLKSIZE);
+
+    ssize_t prevBlock = -1;
+
+    while (NonAlignedCopyIsValid(&a))
+    {
+        ssize_t retOff = 0;
+        ssize_t retSz = 0;
+        NonAlignedCopyNext(&a, &retOff, &retSz);
+
+        ssize_t curBlock = BLOCK_NUMBER(retOff);
+        
+        if (prevBlock == curBlock) continue;
+
+        // get the md5 page from the metadata server
+        char metaQuery[100];
+        sprintf(metaCmd, "GET %lu", curBlock);
+
+        int localResult = redisAppendCommand(s->metaContext, metaCmd);
+
+        if (localResult != REDIS_OK)
+        {
+            error_report("Write command issue error: %d\n", localResult);
+            result = -EIO;
+            break;
+        }
+
+        prevBlock = BLOCK_NUMBER(retOff);
+    }
+
+        u32 hash[MD5_HASH_WORDS];
+        struct md5_ctx ctx;
+        digest_init(&md5_algorithm, &ctx)
+
+        digest_update(&md5_algorithm, &ctx, curBuf, retSz);
+        digest_final(&md5_algorithm, &ctx, hash);
+
+    
+*/
 static int ldb_write(BlockDriverState *bs, int64_t sector_num,
     const uint8_t *buf, int nb_sectors)
 {
     LDBState *s = bs->opaque;
     int result = 0;
 
+    // Issue writes
     NonAlignedCopy a;
     NonAlignedCopyInit(&a, sector_num * SECTOR_SIZE, nb_sectors * SECTOR_SIZE, LDB_BLKSIZE);
 
@@ -320,16 +434,17 @@ static int ldb_write(BlockDriverState *bs, int64_t sector_num,
         if (retSz != LDB_BLKSIZE)
         {
             LOG("less than 4k write at sector=%lu %d retoff=%lu siz=%lu\n", sector_num, nb_sectors, retOff, retSz);
+            assert("not handling read-modify-write for size less than 4k\n");
         }
-
-        char query[100];
-        sprintf(query, "%lu", BLOCK_NUMBER(retOff));
 
         ssize_t relativeOff = retOff - (sector_num * SECTOR_SIZE);
         assert(relativeOff < nb_sectors * SECTOR_SIZE);
         const uint8_t* curBuf = buf + relativeOff;
 
-        int localResult = redisAppendCommand(s->dataContext, "SET %b %b", query, strlen(query), curBuf, retSz);
+        char dataCmd[100];
+        sprintf(dataCmd, "%lu", BLOCK_NUMBER(retOff));
+
+        int localResult = redisAppendCommand(s->data.context, "SET %b %b", dataCmd, strlen(dataCmd), curBuf, retSz);
 
         if (localResult != REDIS_OK)
         {
@@ -359,10 +474,10 @@ static int ldb_write(BlockDriverState *bs, int64_t sector_num,
 
         redisReply* reply = NULL;
 
-        redisGetReply(s->dataContext, (void**)&reply);
+        redisGetReply(s->data.context, (void**)&reply);
         if (reply->type == REDIS_REPLY_ERROR)
         {
-            error_report("Write error: %s %d %s\n", reply->str, s->dataContext->err, s->dataContext->errstr);
+            error_report("Write error: %s %d %s\n", reply->str, s->data.context->err, s->data.context->errstr);
             //freeReplyObject(reply);
             result = -EIO;
             break;
@@ -430,8 +545,8 @@ static void ldb_close(BlockDriverState *bs)
     LDBState *s = bs->opaque;
 
     LOG("closed connection \n");
-    redisFree(s->dataContext);
-    //redisFree(s->metaContext);
+    redisFree(s->data.context);
+    redisFree(s->meta.context);
 }
 
 static int64_t ldb_getlength(BlockDriverState *bs)
