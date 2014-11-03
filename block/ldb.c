@@ -64,6 +64,7 @@ typedef struct LDBState {
     Connection data; 
     Connection meta; 
     int64_t zeroReads;
+    int64_t readModifyWrites;
 } LDBState;
 
 static int ldb_parse_uri(const char *filename, QDict *dict)
@@ -245,6 +246,7 @@ static int ldb_open(BlockDriverState *bs, QDict *dict, int flags,
     LDBState *s = bs->opaque;
 
     s->zeroReads = 0;
+    s->readModifyWrites = 0;
 
     ldb_config(s, dict, errp);
 
@@ -282,7 +284,7 @@ static int ldb_read(BlockDriverState *bs, int64_t sector_num,
 
         if (retSz != LDB_BLKSIZE)
         {
-            LOG("less than 4k read at sector=%lu %d retoff=%lu siz=%lu\n", sector_num, nb_sectors, retOff, retSz);
+            //LOG("less than 4k read at sector=%lu %d retoff=%lu siz=%lu\n", sector_num, nb_sectors, retOff, retSz);
         }
 
         char query[100];
@@ -321,24 +323,26 @@ static int ldb_read(BlockDriverState *bs, int64_t sector_num,
             result = -EIO;
             break;
         }
-        else
+		else
         {
             ssize_t relativeOff = retOff - (sector_num * SECTOR_SIZE);
             assert(relativeOff < nb_sectors * SECTOR_SIZE);
             uint8_t* curBuf = buf + relativeOff;
 
-            if (reply->len == 0)
-            {
-                s->zeroReads ++;
-                bzero(curBuf, retSz);
-            }
-            else
-            {
-                ssize_t minSz = (retSz > reply->len) ? reply->len : retSz;
-                memcpy(curBuf, reply->str + (retOff % LDB_BLKSIZE), minSz);
-                //uint32_t crc = crc32c(0xffffffff, (uint8_t*)reply->str, reply->len);
-                //LOG("read at off=%lu reqsiz=%ld actual=%d checksum=%u\n", retOff, retSz, reply->len, crc);
-            }
+        	if (reply->type == REDIS_REPLY_NIL)
+			{
+            	assert(reply->len == 0);
+            	s->zeroReads ++;
+            	bzero(curBuf, retSz);
+			}
+			else
+			{
+				assert(reply->len == LDB_BLKSIZE);
+				ssize_t minSz = (retSz > reply->len) ? reply->len : retSz;
+				memcpy(curBuf, reply->str + (retOff % LDB_BLKSIZE), minSz);
+				//uint32_t crc = crc32c(0xffffffff, (uint8_t*)reply->str, reply->len);
+				//LOG("read at blk=%lu reqsiz=%ld actual=%d checksum=%u\n", BLOCK_NUMBER(retOff), retSz, reply->len, crc);
+			}
         }
 
         //freeReplyObject(reply);
@@ -431,20 +435,45 @@ static int ldb_write(BlockDriverState *bs, int64_t sector_num,
         ssize_t retSz = 0;
         NonAlignedCopyNext(&a, &retOff, &retSz);
 
-        if (retSz != LDB_BLKSIZE)
-        {
-            LOG("less than 4k write at sector=%lu %d retoff=%lu siz=%lu\n", sector_num, nb_sectors, retOff, retSz);
-            assert("not handling read-modify-write for size less than 4k\n");
-        }
-
         ssize_t relativeOff = retOff - (sector_num * SECTOR_SIZE);
         assert(relativeOff < nb_sectors * SECTOR_SIZE);
         const uint8_t* curBuf = buf + relativeOff;
 
+		const uint8_t* actualBuf = curBuf;
+
+        if (retSz != LDB_BLKSIZE)
+        {
+            //LOG("less than 4k write at sector=%lu %d retoff=%lu siz=%lu\n", sector_num, nb_sectors, retOff, retSz);
+
+	   		actualBuf = (const uint8_t*)malloc(LDB_BLKSIZE);
+			bzero((char*)actualBuf, LDB_BLKSIZE);
+
+			char query[100];
+			sprintf(query, "GET %lu", BLOCK_NUMBER(retOff));
+	        redisReply* reply = redisCommand(s->data.context, query);
+
+			if (reply->type == REDIS_REPLY_ERROR)
+        	{
+            	assert("failed" == 0);
+        	}
+        	else
+        	{
+				if (reply->len == LDB_BLKSIZE)
+				{
+            		//LOG("RMW done at blk=%lu siz=%lu \n", BLOCK_NUMBER(retOff), retSz);
+					s->readModifyWrites ++;
+					memcpy((char*)actualBuf, reply->str, reply->len);
+				}
+        	}
+
+			// current write may not start at 4K boundary
+			memcpy((char*)actualBuf + (retOff % LDB_BLKSIZE), curBuf, retSz);
+        }
+
         char dataCmd[100];
         sprintf(dataCmd, "%lu", BLOCK_NUMBER(retOff));
 
-        int localResult = redisAppendCommand(s->data.context, "SET %b %b", dataCmd, strlen(dataCmd), curBuf, retSz);
+        int localResult = redisAppendCommand(s->data.context, "SET %b %b", dataCmd, strlen(dataCmd), actualBuf, LDB_BLKSIZE);
 
         if (localResult != REDIS_OK)
         {
@@ -454,9 +483,15 @@ static int ldb_write(BlockDriverState *bs, int64_t sector_num,
         }
         else
         {
-            //uint32_t crc = crc32c(0xffffffff, curBuf, retSz);
-            //LOG("write at off=%lu siz=%lu checksum=%u\n", retOff, retSz, crc);
+            //uint32_t crc = crc32c(0xffffffff, actualBuf, LDB_BLKSIZE);
+            //LOG("write at blk=%lu siz=%lu checksum=%u\n", BLOCK_NUMBER(retOff), retSz, crc);
         }
+
+		if (retSz != LDB_BLKSIZE)
+		{
+			free((char*)actualBuf);
+		}
+
     }
     
     if (result != 0)
