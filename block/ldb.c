@@ -31,9 +31,14 @@
 #include "qapi/qmp/qjson.h"
 #include "qapi/qmp/qint.h"
 #include "qapi/qmp/qstring.h"
+
 #include "hiredis/hiredis.h"
+
 #include "NonAlignedCopy.h"
 #include "qemu/crc32c.h"
+
+#include "ldb_crypto.h"
+#include "ldb_md5.h"
 
 #include <sys/types.h>
 #include <unistd.h>
@@ -58,14 +63,23 @@ typedef struct Connection
     redisContext* context;
     int service;
     int port;
+	int64_t missingReads;
+	int64_t reads;
+	int64_t writes;
 } Connection;
 
 typedef struct LDBState {
     Connection data; 
     Connection meta; 
-    int64_t zeroReads;
     int64_t readModifyWrites;
 } LDBState;
+
+#define MD5_LEN 16
+typedef char MD5_t[MD5_LEN];
+
+#define SECTOR_SIZE (512)
+#define LDB_BLKSIZE (4096)
+#define BLOCK_NUMBER(off) (off/4096)
 
 static int ldb_parse_uri(const char *filename, QDict *dict)
 {
@@ -194,6 +208,11 @@ static int ldb_establish_connection(BlockDriverState *bs, Error** errp)
         return -ENOTCONN;
     }
 
+    // Send Ping to LDB and get Pong back 
+    //result = ldb_client_session_init(&s->client, bs, sock, export);
+    //g_free(export);
+
+
     return 0;
 }
 
@@ -245,33 +264,253 @@ static int ldb_open(BlockDriverState *bs, QDict *dict, int flags,
 {
     LDBState *s = bs->opaque;
 
-    s->zeroReads = 0;
+    s->data.reads = s->data.writes = s->data.missingReads = 0;
+    s->meta.reads = s->meta.writes = s->meta.missingReads = 0;
     s->readModifyWrites = 0;
 
     ldb_config(s, dict, errp);
 
     int ret = ldb_establish_connection(bs, errp);
 
-    /* LDB handshake */
-    //result = ldb_client_session_init(&s->client, bs, sock, export);
-    //g_free(export);
-
     LOG("opened connection with ret=%d\n", ret);
     return ret;
 }
 
-//#define LDB_BLKSIZE (4096)
-//#define NUMSECTORS (LDB_BLKSIZE/512)
+// ============================
 
-#define SECTOR_SIZE (512)
-#define LDB_BLKSIZE (4096)
-#define BLOCK_NUMBER(off) (off/4096)
+int DataSetCmdAsync(LDBState* s, MD5_t md5, const char* buffer);
+int DataSetReplyAsync(LDBState* s);
+int DataGetCmd(LDBState* s, MD5_t md5, char* buffer);
+int DataGetCmdAsync(LDBState* s, MD5_t md5);
+int DataGetReplyAsync(LDBState* s, char* buffer, ssize_t startOffset, ssize_t bufferSize);
+int MetaSetCmdAsync(LDBState* s, ssize_t offset, MD5_t md5);
+int MetaSetReplyAsync(LDBState* s);
+int MetaGetCmd(LDBState* s, ssize_t offset, MD5_t md5);
+int MetaGetCmdAsync(LDBState* s, ssize_t offset);
+int MetaGetReplyAsync(LDBState* s, MD5_t md5);
 
+int DataSetCmdAsync(LDBState* s, MD5_t md5, const char* buffer)
+{
+    int localResult  = redisAppendCommand(s->data.context, "SETNX %b %b", md5, MD5_LEN, buffer, LDB_BLKSIZE);
+
+    if (localResult != REDIS_OK)
+    {
+        error_report("SET command issue error: %d\n", localResult);
+        return -EIO;
+    }
+    return 0;
+}
+
+int DataSetReplyAsync(LDBState* s)
+{
+    redisReply* reply = NULL;
+
+    redisGetReply(s->data.context, (void**)&reply);
+    if (reply->type == REDIS_REPLY_ERROR)
+    {
+        error_report("SET error: %s %d %s\n", reply->str, s->data.context->err, s->data.context->errstr);
+        return -EIO;
+    }
+    //freeReplyObject(reply);
+	s->data.writes ++;
+    return 0;
+}
+
+int DataGetCmd(LDBState* s, MD5_t md5, char* buffer)
+{
+	redisReply* reply = redisCommand(s->data.context, "GET %b", md5, MD5_LEN);
+
+	if (reply->type == REDIS_REPLY_ERROR)
+	{
+        error_report("GET error: %s %d %s\n", reply->str, s->data.context->err, s->data.context->errstr);
+		return -EIO;
+	}
+	else if ((reply->type == REDIS_REPLY_NIL) || (reply->type == REDIS_REPLY_STATUS))
+	{
+		return -ENOENT;
+	}
+	else
+	{
+		assert (reply->len == LDB_BLKSIZE);
+		assert (reply->type == REDIS_REPLY_STRING);
+		s->data.reads ++;
+
+		memcpy(buffer, reply->str, reply->len);
+		return 0;
+	}
+    assert("dont come here" == 0);
+}
+
+int DataGetCmdAsync(LDBState* s, MD5_t md5)
+{
+    int localResult  = redisAppendCommand(s->data.context, "GET %b", md5, MD5_LEN);
+
+    if (localResult != REDIS_OK)
+    {
+        error_report("GET command issue error: %d\n", localResult);
+        return -EIO;
+    }
+    return 0;
+}
+
+int DataGetReplyAsync(LDBState* s, char* buffer, ssize_t startOffset, ssize_t bufferSize)
+{
+    redisReply* reply = NULL;
+    redisGetReply(s->data.context, (void**)&reply);
+
+    if (reply->type == REDIS_REPLY_ERROR)
+    {
+        error_report("GET error: %s %d %s\n", reply->str, s->data.context->err, s->data.context->errstr);
+        return -EIO;
+    }
+    else
+    {
+        if (reply->type == REDIS_REPLY_NIL)
+        {
+            // block was never written - no md5 exists for offset
+			s->data.missingReads ++;
+            return -ENOENT;
+        }
+        else
+        {
+			s->data.reads ++;
+            assert(reply->len == LDB_BLKSIZE);
+            assert(reply->len >= bufferSize);
+            assert(startOffset < LDB_BLKSIZE);
+            assert (reply->type == REDIS_REPLY_STRING);
+            memcpy(buffer, reply->str + startOffset, bufferSize);
+            return 0;
+        }
+    }
+    assert("dont come here" == 0);
+}
+
+int MetaSetCmdAsync(LDBState* s, ssize_t offset, MD5_t md5)
+{
+    char dataCmd[100];
+    sprintf(dataCmd, "%lu", BLOCK_NUMBER(offset));
+
+    int localResult = redisAppendCommand(s->meta.context, "SET %b %b", dataCmd, strlen(dataCmd), md5, MD5_LEN);
+
+    if (localResult != REDIS_OK)
+    {
+        error_report("Write command issue error: %d\n", localResult);
+        return -EIO;
+    }
+    return 0;
+}
+
+int MetaSetReplyAsync(LDBState* s)
+{
+    redisReply* reply = NULL;
+
+    redisGetReply(s->meta.context, (void**)&reply);
+    if (reply->type == REDIS_REPLY_ERROR)
+    {
+        error_report("Write error: %s %d %s\n", reply->str, s->meta.context->err, s->meta.context->errstr);
+        return -EIO;
+    }
+    //freeReplyObject(reply);
+	s->meta.writes ++;
+    return 0;
+}
+
+int MetaGetCmd(LDBState* s, ssize_t offset, MD5_t md5)
+{
+	char query[100];
+	sprintf(query, "GET %lu", BLOCK_NUMBER(offset));
+
+	redisReply* reply = redisCommand(s->meta.context, query);
+
+	if (reply->type == REDIS_REPLY_ERROR)
+	{
+        error_report("Read error: %s %d %s\n", reply->str, s->meta.context->err, s->meta.context->errstr);
+		return -EIO;
+	}
+	else if ((reply->type == REDIS_REPLY_NIL) || (reply->type == REDIS_REPLY_STATUS))
+	{
+		s->meta.missingReads ++;
+		return -ENOENT;
+	}
+	else
+	{
+		s->meta.reads ++;
+		assert (reply->len == MD5_LEN);
+		assert (reply->type == REDIS_REPLY_STRING);
+
+		memcpy(md5, reply->str, reply->len);
+		return 0;
+	}
+}
+
+int MetaGetCmdAsync(LDBState* s, ssize_t offset)
+{
+    char query[100];
+    sprintf(query, "GET %lu", BLOCK_NUMBER(offset));
+
+    int localResult  = redisAppendCommand(s->meta.context, query);
+
+    if (localResult != REDIS_OK)
+    {
+        error_report("Read command issue error: %d\n", localResult);
+        return -EIO;
+    }
+    return 0;
+}
+
+int MetaGetReplyAsync(LDBState* s, MD5_t md5)
+{
+    redisReply* reply = NULL;
+    redisGetReply(s->meta.context, (void**)&reply);
+
+    if (reply->type == REDIS_REPLY_ERROR)
+    {
+        error_report("Read error: %s %d %s\n", reply->str, s->meta.context->err, s->meta.context->errstr);
+        //freeReplyObject(reply);
+        return -EIO;
+    }
+	else if (reply->type == REDIS_REPLY_NIL)
+	{
+		// block was never written - no md5 exists for offset
+		s->meta.missingReads ++;
+		return -ENOENT;
+	}
+	else
+	{
+		s->meta.reads ++;
+		assert(reply->len == MD5_LEN);
+		assert (reply->type == REDIS_REPLY_STRING);
+
+		memcpy(md5, reply->str, reply->len);
+		return 0;
+	}
+    assert("dont come here" == 0);
+}
+
+// ============================
+
+/*
+ *  MetaData : key=offset, value=md5
+ *  Data     : key=md5, value=buffer
+ */
 static int ldb_read(BlockDriverState *bs, int64_t sector_num,
     uint8_t *buf, int nb_sectors)
 {
     LDBState *s = bs->opaque;
     int result = 0;
+
+    /* 
+        md5 = control->get(block)
+        if (md5)
+            buffer = data->get(md5)
+            memcpy(newbuf, buffer, 4k)
+        else
+            bzero(newbuf, 4k)
+    */
+
+    const size_t blocksToReadSz = ((nb_sectors/8) + 2);
+    char* blocksToRead = (char*)malloc(blocksToReadSz);
+    bzero(blocksToRead, blocksToReadSz);
 
     NonAlignedCopy a;
     NonAlignedCopyInit(&a, sector_num * SECTOR_SIZE, nb_sectors * SECTOR_SIZE, LDB_BLKSIZE);
@@ -287,14 +526,10 @@ static int ldb_read(BlockDriverState *bs, int64_t sector_num,
             //LOG("less than 4k read at sector=%lu %d retoff=%lu siz=%lu\n", sector_num, nb_sectors, retOff, retSz);
         }
 
-        char query[100];
-        sprintf(query, "GET %lu", BLOCK_NUMBER(retOff));
+        int localResult = MetaGetCmdAsync(s, retOff);
 
-        int localResult  = redisAppendCommand(s->data.context, query);
-
-        if (localResult != REDIS_OK)
+        if (localResult != 0)
         {
-            error_report("Read command issue error: %d\n", localResult);
             result = -EIO;
             break;
         }
@@ -307,125 +542,122 @@ static int ldb_read(BlockDriverState *bs, int64_t sector_num,
 
     NonAlignedCopyInit(&a, sector_num * SECTOR_SIZE, nb_sectors * SECTOR_SIZE, LDB_BLKSIZE);
 
+    int blocksIndex = 0;
+
     while (NonAlignedCopyIsValid(&a))
     {
         ssize_t retOff = 0;
         ssize_t retSz = 0;
         NonAlignedCopyNext(&a, &retOff, &retSz);
 
-        redisReply* reply = NULL;
-        redisGetReply(s->data.context, (void**)&reply);
-
-        if (reply->type == REDIS_REPLY_ERROR)
+        MD5_t md5;
+        
+        int localResult = MetaGetReplyAsync(s, md5);
+    
+        if (localResult == 0)
         {
-            error_report("Read error: %s %d %s\n", reply->str, s->data.context->err, s->data.context->errstr);
-            //freeReplyObject(reply);
+            // fetch the block from data server
+            blocksToRead[blocksIndex] = '1';
+
+            DataGetCmdAsync(s, md5);
+            //uint32_t crc = crc32c(0xffffffff, (uint8_t*)reply->str, reply->len);
+            //LOG("read at blk=%lu reqsiz=%ld actual=%d checksum=%u\n", BLOCK_NUMBER(retOff), retSz, reply->len, crc);
+        }
+		else if (localResult == -ENOENT)
+        {
+        }
+    	else
+	    {
             result = -EIO;
             break;
         }
-		else
-        {
-            ssize_t relativeOff = retOff - (sector_num * SECTOR_SIZE);
-            assert(relativeOff < nb_sectors * SECTOR_SIZE);
-            uint8_t* curBuf = buf + relativeOff;
-
-        	if (reply->type == REDIS_REPLY_NIL)
-			{
-            	assert(reply->len == 0);
-            	s->zeroReads ++;
-            	bzero(curBuf, retSz);
-			}
-			else
-			{
-				assert(reply->len == LDB_BLKSIZE);
-				ssize_t minSz = (retSz > reply->len) ? reply->len : retSz;
-				memcpy(curBuf, reply->str + (retOff % LDB_BLKSIZE), minSz);
-				//uint32_t crc = crc32c(0xffffffff, (uint8_t*)reply->str, reply->len);
-				//LOG("read at blk=%lu reqsiz=%ld actual=%d checksum=%u\n", BLOCK_NUMBER(retOff), retSz, reply->len, crc);
-			}
-        }
 
         //freeReplyObject(reply);
+        blocksIndex ++;
     }
+
+    if (result != 0)
+    {
+        return result;
+    }
+
+    NonAlignedCopyInit(&a, sector_num * SECTOR_SIZE, nb_sectors * SECTOR_SIZE, LDB_BLKSIZE);
+
+    blocksIndex = 0;
+
+    while (NonAlignedCopyIsValid(&a))
+    {
+        ssize_t retOff = 0;
+        ssize_t retSz = 0;
+        NonAlignedCopyNext(&a, &retOff, &retSz);
+
+        ssize_t relativeOff = retOff - (sector_num * SECTOR_SIZE);
+        assert(relativeOff < nb_sectors * SECTOR_SIZE);
+        uint8_t* curBuf = buf + relativeOff;
+
+		if (blocksToRead[blocksIndex] != '1')
+        {
+          	bzero(curBuf, retSz);
+        }
+        else
+        {
+            ssize_t startOffset = retOff % LDB_BLKSIZE; // if retOff is not 4k-aligned, memcpy has to be done in middle of buffer
+
+            int localResult = DataGetReplyAsync(s, (char*) curBuf, startOffset, retSz);
+
+            //uint32_t crc = crc32c(0xffffffff, (uint8_t*)reply->str, reply->len);
+            //LOG("read at blk=%lu reqsiz=%ld actual=%d checksum=%u\n", BLOCK_NUMBER(retOff), retSz, reply->len, crc);
+
+            if (localResult != 0)
+            {
+                result = -EIO;
+                break;
+            }
+            //freeReplyObject(reply);
+        }
+        blocksIndex ++;
+    }
+
+    free(blocksToRead);
 
     return 0;
 }
 
-/*
-    struct dictType md5DictType
-    {
-        callbackHash
-        NULL
-        callbackValDup
-        callbackKeyCmp
-        callbackKeyDtor
-        callbackValDtor
-    };
+void computeMD5(const char* buffer, MD5_t md5);
 
-    md6dict.hashFunction = dictGenHashFunc()
-    md5dict = dictCreate(&md5DictType, NULL)
-    dictAdd(&md5Dict, key, val)
-    dictDelete(&md5Dict, key)
-    dictRelease(&md5Dict)
-    dictFind(&md5Dict, key)
+void computeMD5(const char* buffer, MD5_t md5)
+{
+    struct md5_ctx ctx;
+    digest_init(&md5_algorithm, &ctx);
 
-    for each 4k block
-        Get md5 page from meta server
-    
-    for each 4k block   
-        compute new md5
-        write page to data server
-    
-    for each new md5 generated
-        write page to meta server
+    digest_update(&md5_algorithm, &ctx, buffer, LDB_BLKSIZE);
 
-    NonAlignedCopy a;
-    NonAlignedCopyInit(&a, sector_num * SECTOR_SIZE, nb_sectors * SECTOR_SIZE, LDB_BLKSIZE);
+    digest_final(&md5_algorithm, &ctx, md5);
+}
 
-    ssize_t prevBlock = -1;
-
-    while (NonAlignedCopyIsValid(&a))
-    {
-        ssize_t retOff = 0;
-        ssize_t retSz = 0;
-        NonAlignedCopyNext(&a, &retOff, &retSz);
-
-        ssize_t curBlock = BLOCK_NUMBER(retOff);
-        
-        if (prevBlock == curBlock) continue;
-
-        // get the md5 page from the metadata server
-        char metaQuery[100];
-        sprintf(metaCmd, "GET %lu", curBlock);
-
-        int localResult = redisAppendCommand(s->metaContext, metaCmd);
-
-        if (localResult != REDIS_OK)
-        {
-            error_report("Write command issue error: %d\n", localResult);
-            result = -EIO;
-            break;
-        }
-
-        prevBlock = BLOCK_NUMBER(retOff);
-    }
-
-        u32 hash[MD5_HASH_WORDS];
-        struct md5_ctx ctx;
-        digest_init(&md5_algorithm, &ctx)
-
-        digest_update(&md5_algorithm, &ctx, curBuf, retSz);
-        digest_final(&md5_algorithm, &ctx, hash);
-
-    
-*/
 static int ldb_write(BlockDriverState *bs, int64_t sector_num,
     const uint8_t *buf, int nb_sectors)
 {
     LDBState *s = bs->opaque;
     int result = 0;
 
-    // Issue writes
+    /* 
+        If partial 4k write
+            md5 = control->get(block)
+            if (md5)
+                buffer = data->get(md5)
+                memcpy(newbuf, buffer, 4k)
+                memcpy(newbuf, curbuf, wherever)
+            else
+                bzero(newbuf, 4k)
+                memcpy(newbuf, curbuf, wherever)
+       else
+            Delete old md5 from data server (if ref count == 1)
+        Compute new_md5 for newbuf
+        data->setnx(new_md5, newbuf)
+        control->set(block, new_md5)
+    */
+
     NonAlignedCopy a;
     NonAlignedCopyInit(&a, sector_num * SECTOR_SIZE, nb_sectors * SECTOR_SIZE, LDB_BLKSIZE);
 
@@ -448,50 +680,49 @@ static int ldb_write(BlockDriverState *bs, int64_t sector_num,
 	   		actualBuf = (const uint8_t*)malloc(LDB_BLKSIZE);
 			bzero((char*)actualBuf, LDB_BLKSIZE);
 
-			char query[100];
-			sprintf(query, "GET %lu", BLOCK_NUMBER(retOff));
-	        redisReply* reply = redisCommand(s->data.context, query);
+			MD5_t md5;	
+			int localResult = MetaGetCmd(s, retOff, md5);
 
-			if (reply->type == REDIS_REPLY_ERROR)
-        	{
-            	assert("failed" == 0);
-        	}
-        	else
-        	{
-				if (reply->len == LDB_BLKSIZE)
-				{
-            		//LOG("RMW done at blk=%lu siz=%lu \n", BLOCK_NUMBER(retOff), retSz);
-					s->readModifyWrites ++;
-					memcpy((char*)actualBuf, reply->str, reply->len);
-				}
-        	}
+			if (localResult == 0)
+			{
+				// overlay old block, if any, onto the new block
+				localResult = DataGetCmd(s, md5, (char*)actualBuf);
+				assert(localResult == 0);
+				//LOG("RMW done at blk=%lu siz=%lu \n", BLOCK_NUMBER(retOff), retSz);
+				s->readModifyWrites ++;
+			}
 
 			// current write may not start at 4K boundary
 			memcpy((char*)actualBuf + (retOff % LDB_BLKSIZE), curBuf, retSz);
         }
 
-        char dataCmd[100];
-        sprintf(dataCmd, "%lu", BLOCK_NUMBER(retOff));
+        //Compute new_md5 for newbuf
+        MD5_t newmd5;
+        computeMD5((const char*)actualBuf, newmd5);
 
-        int localResult = redisAppendCommand(s->data.context, "SET %b %b", dataCmd, strlen(dataCmd), actualBuf, LDB_BLKSIZE);
-
-        if (localResult != REDIS_OK)
+        //data->setnx(new_md5, newbuf)
+        int localResult = DataSetCmdAsync(s, newmd5, (const char*)actualBuf);
+        if (localResult != 0)
         {
-            error_report("Write command issue error: %d\n", localResult);
             result = -EIO;
             break;
         }
-        else
+
+        //control->set(block, new_md5)
+        localResult = MetaSetCmdAsync(s, retOff, newmd5);
+        if (localResult != 0)
         {
-            //uint32_t crc = crc32c(0xffffffff, actualBuf, LDB_BLKSIZE);
-            //LOG("write at blk=%lu siz=%lu checksum=%u\n", BLOCK_NUMBER(retOff), retSz, crc);
+            result = -EIO;
+            break;
         }
+
+        //uint32_t crc = crc32c(0xffffffff, actualBuf, LDB_BLKSIZE);
+        //LOG("write at blk=%lu siz=%lu checksum=%u\n", BLOCK_NUMBER(retOff), retSz, crc);
 
 		if (retSz != LDB_BLKSIZE)
 		{
 			free((char*)actualBuf);
 		}
-
     }
     
     if (result != 0)
@@ -507,13 +738,16 @@ static int ldb_write(BlockDriverState *bs, int64_t sector_num,
         ssize_t retSz;
         NonAlignedCopyNext(&a, &retOff, &retSz);
 
-        redisReply* reply = NULL;
-
-        redisGetReply(s->data.context, (void**)&reply);
-        if (reply->type == REDIS_REPLY_ERROR)
+        int localResult = MetaSetReplyAsync(s);
+        if (localResult != 0)
         {
-            error_report("Write error: %s %d %s\n", reply->str, s->data.context->err, s->data.context->errstr);
-            //freeReplyObject(reply);
+            result = -EIO;
+            break;
+        }
+
+        localResult = DataSetReplyAsync(s);
+        if (localResult != 0)
+        {
             result = -EIO;
             break;
         }
