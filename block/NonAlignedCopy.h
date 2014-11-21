@@ -1,6 +1,10 @@
 #ifndef NONALIGNEDCOPYHANDLER_H
 #define NONALIGNEDCOPYHANDLER_H
 
+ // Copyright (C) 2014 
+ //     Author: Sandeep Joshi
+ //
+
     // Purpose of this structure is to encapsulate calculations done during non-aligned IO
     // .e.g you want to read len=8k from start=6K but blockSize=4K
     // this will require reading 3 chunks of blockSize
