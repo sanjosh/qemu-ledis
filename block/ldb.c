@@ -81,92 +81,6 @@ typedef char MD5_t[MD5_LEN];
 #define LDB_BLKSIZE (4096)
 #define BLOCK_NUMBER(off) (off/4096)
 
-static int ldb_parse_uri(const char *filename, QDict *dict)
-{
-    URI *uri;
-    QueryParams *qp = NULL;
-    int ret = 0;
-
-    uri = uri_parse(filename);
-    if (!uri) {
-        return -EINVAL;
-    }
-
-    // transport 
-    if (strcmp(uri->scheme, "ldb") != 0) {
-        ret = -EINVAL;
-        goto out;
-    }
-
-    qp = query_params_parse(uri->query);
-    if (qp->n > 1) {
-        ret = -EINVAL;
-        goto out;
-    }
-
-    {
-        if ((!uri->server) || (!uri->port)) {
-            ret = -EINVAL;
-            goto out;
-        }
-        
-        QString* host = qstring_from_str(uri->server);
-        qdict_put(dict, "host", host);
-
-        char* port_str = g_strdup_printf("%d", uri->port);
-        qdict_put(dict, "port", qstring_from_str(port_str));
-        g_free(port_str);
-    }
-
-out:
-    if (qp) {
-        query_params_free(qp);
-    }
-    uri_free(uri);
-    return ret;
-}
-
-static void ldb_parse_filename(const char *filename, QDict *dict,
-                               Error **errp)
-{
-    char *file;
-    const char *host_spec;
-
-    if (strstr(filename, "://")) {
-        int ret = ldb_parse_uri(filename, dict);
-        if (ret < 0) {
-            error_setg(errp, "No valid URL specified");
-        }
-        return;
-    }
-
-    file = g_strdup(filename);
-
-    // extract the host_spec - fail if it's not ldb:... 
-    if (!strstart(file, "ldb:", &host_spec)) {
-        error_setg(errp, "File name string for LDB must start with 'ldb:'");
-        goto out;
-    }
-
-    if (!*host_spec) {
-        goto out;
-    }
-
-    {
-        InetSocketAddress* addr = inet_parse(host_spec, errp);
-
-        if (!addr) {
-            goto out;
-        }
-
-        qdict_put(dict, "host", qstring_from_str(addr->host));
-        qdict_put(dict, "port", qstring_from_str(addr->port));
-        qapi_free_InetSocketAddress(addr);
-    }
-
-out:
-    g_free(file);
-}
 
 static int ldb_establish_connection(BlockDriverState *bs, Error** errp)
 {
@@ -221,9 +135,24 @@ static QemuOptsList runtime_opts = {
     .head = QTAILQ_HEAD_INITIALIZER(runtime_opts.head),
     .desc = {
         {
-            .name = "filename",
+            .name = "datahost",
             .type = QEMU_OPT_STRING,
-            .help = "LDB image name", 
+            .help = "LDB Dataserver TIPC addresses ", 
+        },
+        {
+            .name = "dataport",
+            .type = QEMU_OPT_STRING,
+            .help = "LDB Dataserver TIPC port ", 
+        },
+        {
+            .name = "metahost",
+            .type = QEMU_OPT_STRING,
+            .help = "LDB MetaDataServer TIPC addresses ", 
+        },
+        {
+            .name = "metaport",
+            .type = QEMU_OPT_STRING,
+            .help = "LDB MetaDataServer TIPC port ", 
         },
         { /* end of list */ }
     },
@@ -237,26 +166,36 @@ static void ldb_config(LDBState* s, QDict* dict, Error** errp)
 
     qemu_opts_absorb_qdict(opts, dict, &local_err);
 
-    const char* hostname = qemu_opt_get(opts, "host");
-    if (hostname) {
-        s->data.service = atoi(hostname);
+    const char* datahost = qemu_opt_get(opts, "datahost");
+    if (datahost) {
+        s->data.service = atoi(datahost);
     } else {
         s->data.service = DATASERVICE;
     }
 
-    const char* portname = qemu_opt_get(opts, "port");
-    if (portname) {
-        s->data.port = atoi(portname);
+    const char* dataport = qemu_opt_get(opts, "dataport");
+    if (dataport) {
+        s->data.port = atoi(dataport);
     } else {
         s->data.port = DATAPORT;
     }
-    
-    s->meta.service = METASERVICE;
-    s->meta.port = METAPORT;
 
+
+    const char* metahost = qemu_opt_get(opts, "metahost");
+    if (metahost) {
+        s->meta.service = atoi(metahost);
+    } else {
+        s->meta.service = METASERVICE;
+    }
+
+    const char* metaport = qemu_opt_get(opts, "metaport");
+    if (metaport) {
+        s->meta.port = atoi(metaport);
+    } else {
+        s->meta.port = METAPORT;
+    }
+    
     qemu_opts_del(opts);
-    qdict_del(dict, "host");
-    qdict_del(dict, "port");
 }
 
 static int ldb_open(BlockDriverState *bs, QDict *dict, int flags,
@@ -856,7 +795,7 @@ static BlockDriver bdrv_ldb = {
     .protocol_name              = "ldb",
     .instance_size              = sizeof(LDBState),
     //.bdrv_needs_filename        = true,
-    .bdrv_parse_filename        = ldb_parse_filename,
+    //.bdrv_parse_filename        = ldb_parse_filename,
     .bdrv_file_open             = ldb_open,
     .bdrv_read                  = ldb_read,
     .bdrv_write                 = ldb_write,
